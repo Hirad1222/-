@@ -13,10 +13,11 @@ permissions:
 
 jobs:
   build:
+    name: Build Android APK
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Setup Java
@@ -27,17 +28,24 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.13'
 
-      - name: Extract project
+      - name: Extract Project
         run: |
           unzip -o AutoRouteVPN-updated.zip -d source
 
-      - name: Build APK
+      - name: Verify Project Files
+        run: |
+          ls -la source/AutoRouteVPN
+          test -f source/AutoRouteVPN/settings.gradle || test -f source/AutoRouteVPN/settings.gradle.kts
+
+      - name: Build Debug APK
         run: |
           cd source/AutoRouteVPN
           gradle --no-daemon assembleDebug
@@ -48,4 +56,5 @@ jobs:
           name: AutoRouteVPN-APK
           path: source/AutoRouteVPN/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+          retention-days: 14
           
