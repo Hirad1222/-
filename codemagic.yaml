@@ -14,40 +14,72 @@ workflows:
         - $HOME/.gradle/wrapper/dists
 
     scripts:
-      - name: Prepare Android SDK 36
+      - name: Prepare Modern Android SDK 36
         script: |
           set -e
 
-          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Library/Android/sdk}}"
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/share/android-sdk}}"
+          TOOLS_DIR="$SDK_ROOT/cmdline-tools"
+          TEMP_DIR="$CM_BUILD_DIR/android-tools-temp"
 
-          if [ ! -d "$SDK_ROOT" ]; then
-            echo "ERROR: Android SDK directory not found: $SDK_ROOT"
-            exit 1
-          fi
-
-          SDKMANAGER="$(command -v sdkmanager || true)"
-
-          if [ -z "$SDKMANAGER" ]; then
-            SDKMANAGER="$(find "$SDK_ROOT" -type f -name sdkmanager -print -quit 2>/dev/null || true)"
-          fi
-
-          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
-            echo "ERROR: sdkmanager not found!"
-            exit 1
-          fi
+          mkdir -p "$SDK_ROOT" "$TOOLS_DIR" "$TEMP_DIR"
 
           echo "Android SDK: $SDK_ROOT"
 
-          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null || true
+          # Use modern Google command-line tools.
+          SDKMANAGER="$TOOLS_DIR/latest/bin/sdkmanager"
 
-          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install \
+          if [ ! -x "$SDKMANAGER" ]; then
+            echo "Downloading modern Android command-line tools..."
+
+            curl --fail --location --retry 3 \
+              "https://dl.google.com/android/repository/commandlinetools-mac-13114758_latest.zip" \
+              --output "$TEMP_DIR/commandline-tools.zip"
+
+            mkdir -p "$TEMP_DIR/extracted"
+
+            unzip -q -o \
+              "$TEMP_DIR/commandline-tools.zip" \
+              -d "$TEMP_DIR/extracted"
+
+            if [ ! -f "$TEMP_DIR/extracted/cmdline-tools/bin/sdkmanager" ]; then
+              echo "ERROR: sdkmanager was not found in downloaded archive."
+              exit 1
+            fi
+
+            rm -rf "$TOOLS_DIR/latest"
+            mkdir -p "$TOOLS_DIR/latest"
+
+            cp -R "$TEMP_DIR/extracted/cmdline-tools/." \
+              "$TOOLS_DIR/latest/"
+          fi
+
+          SDKMANAGER="$TOOLS_DIR/latest/bin/sdkmanager"
+
+          if [ ! -x "$SDKMANAGER" ]; then
+            echo "ERROR: Modern sdkmanager installation failed."
+            exit 1
+          fi
+
+          echo "Using: $SDKMANAGER"
+          java -version
+
+          yes | "$SDKMANAGER" \
+            --sdk_root="$SDK_ROOT" \
+            --licenses || true
+
+          "$SDKMANAGER" \
+            --sdk_root="$SDK_ROOT" \
+            --install \
             "platform-tools" \
             "platforms;android-36"
 
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$CM_ENV"
           echo "ANDROID_HOME=$SDK_ROOT" >> "$CM_ENV"
 
-      - name: Extract and locate project
+          echo "Android SDK setup completed."
+
+      - name: Extract and Locate Project
         script: |
           set -e
 
@@ -55,7 +87,7 @@ workflows:
           SOURCE_DIR="$CM_BUILD_DIR/source"
 
           if [ ! -f "$ZIP_FILE" ]; then
-            echo "ERROR: Project ZIP not found!"
+            echo "ERROR: AutoRouteVPN-updated.zip not found!"
             ls -la "$CM_BUILD_DIR"
             exit 1
           fi
@@ -71,6 +103,7 @@ workflows:
 
           if [ -z "$SETTINGS_FILE" ]; then
             echo "ERROR: Gradle settings file not found!"
+            find "$SOURCE_DIR" -maxdepth 5 -type f
             exit 1
           fi
 
@@ -83,31 +116,28 @@ workflows:
           fi
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$CM_ENV"
-          echo "Project found: $PROJECT_DIR"
 
-      - name: Install Gradle 8.13 and configure SDK
+          echo "Project located: $PROJECT_DIR"
+          ls -la "$PROJECT_DIR"
+
+      - name: Install Gradle 8.13
         script: |
           set -e
 
-          cd "$PROJECT_DIR"
-
-          printf 'sdk.dir=%s\n' "$ANDROID_SDK_ROOT" > local.properties
-
           GRADLE_VERSION="8.13"
-          GRADLE_DIST_DIR="$CM_BUILD_DIR/.gradle-dist"
-          GRADLE_HOME="$GRADLE_DIST_DIR/gradle-$GRADLE_VERSION"
+          GRADLE_DIR="$CM_BUILD_DIR/gradle-install"
+          GRADLE_HOME="$GRADLE_DIR/gradle-$GRADLE_VERSION"
           GRADLE_BIN="$GRADLE_HOME/bin/gradle"
 
-          if [ ! -x "$GRADLE_BIN" ]; then
-            mkdir -p "$GRADLE_DIST_DIR"
+          mkdir -p "$GRADLE_DIR"
 
+          if [ ! -x "$GRADLE_BIN" ]; then
             curl --fail --location --retry 3 \
               "https://services.gradle.org/distributions/gradle-$GRADLE_VERSION-bin.zip" \
-              --output "$GRADLE_DIST_DIR/gradle-$GRADLE_VERSION-bin.zip"
+              --output "$GRADLE_DIR/gradle.zip"
 
-            unzip -q -o \
-              "$GRADLE_DIST_DIR/gradle-$GRADLE_VERSION-bin.zip" \
-              -d "$GRADLE_DIST_DIR"
+            unzip -q -o "$GRADLE_DIR/gradle.zip" \
+              -d "$GRADLE_DIR"
           fi
 
           if [ ! -x "$GRADLE_BIN" ]; then
@@ -115,10 +145,22 @@ workflows:
             exit 1
           fi
 
-          FILE="$PROJECT_DIR/app/build.gradle.kts"
+          "$GRADLE_BIN" --version
+
+          echo "GRADLE_BIN=$GRADLE_BIN" >> "$CM_ENV"
+
+      - name: Configure Android Project
+        script: |
+          set -e
+
+          cd "$PROJECT_DIR"
+
+          printf 'sdk.dir=%s\n' "$ANDROID_SDK_ROOT" > local.properties
+
+          FILE="app/build.gradle.kts"
 
           if [ ! -f "$FILE" ]; then
-            FILE="$PROJECT_DIR/app/build.gradle"
+            FILE="app/build.gradle"
           fi
 
           python3 - "$FILE" <<'PY'
@@ -128,42 +170,43 @@ workflows:
           path = sys.argv[1]
 
           with open(path, "r", encoding="utf-8") as f:
-              text = f.read()
+              content = f.read()
 
           patterns = [
               r'(?m)^(\s*compileSdk\s*=\s*)\d+(\s*(?://.*)?)$',
-              r'(?m)^(\s*compileSdk\s+)\d+(\s*(?://.*)?)$',
+              r'(?m)^(\s*compileSdk\s+)\d+(\s*(?://.*)?)$'
           ]
 
-          updated = text
-          count = 0
+          updated = content
+          changed = False
 
           for pattern in patterns:
               updated, count = re.subn(
                   pattern,
-                  r'\g<1>36\g<2>',
+                  lambda m: m.group(1) + "36" + m.group(2),
                   updated,
                   count=1
               )
+
               if count:
+                  changed = True
                   break
 
-          if not count:
+          if not changed:
               raise SystemExit(
-                  "ERROR: Could not safely update numeric compileSdk."
+                  "ERROR: Numeric compileSdk declaration not found. "
+                  "Check the Gradle configuration."
               )
 
           with open(path, "w", encoding="utf-8") as f:
               f.write(updated)
 
-          print("compileSdk successfully set to 36")
+          print("compileSdk configured to 36.")
           PY
 
           grep -n "compileSdk" "$FILE"
 
-          echo "GRADLE_BIN=$GRADLE_BIN" >> "$CM_ENV"
-
-      - name: Build Android Debug APK
+      - name: Build Debug APK
         script: |
           set -e
 
@@ -175,16 +218,16 @@ workflows:
             --build-cache \
             assembleDebug
 
-      - name: Verify and collect APK
+      - name: Verify and Collect APK
         script: |
           set -e
 
-          APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
+          APK="$(find "$PROJECT_DIR/app/build/outputs/apk" \
+            -type f -name "*.apk" -print -quit)"
 
-          if [ ! -f "$APK" ]; then
+          if [ -z "$APK" ]; then
             echo "ERROR: APK was not generated!"
-            find "$PROJECT_DIR/app/build/outputs" \
-              -type f -name '*.apk' -print 2>/dev/null || true
+            find "$PROJECT_DIR" -type f -name "*.apk" -print
             exit 1
           fi
 
