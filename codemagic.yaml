@@ -3,46 +3,78 @@ workflows:
   autoroutevpn-android:
     name: AutoRoute VPN - Android APK
     max_build_duration: 60
-    instance_type: linux_x2
+    instance_type: mac_mini_m2
 
     environment:
       java: 17
 
+    cache:
+      cache_paths:
+        - $HOME/.gradle/caches
+        - $HOME/.gradle/wrapper/dists
+
     scripts:
-      - name: Install Android SDK 36
+      - name: Prepare Android SDK 36
         script: |
           set -e
-          yes | sdkmanager --licenses >/dev/null
-          sdkmanager --install "platform-tools" "platforms;android-36"
 
-      - name: Extract project ZIP
-        script: |
-          set -e
-          ZIP_FILE="$CM_BUILD_DIR/AutoRouteVPN-updated.zip"
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Library/Android/sdk}}"
 
-          if [ ! -f "$ZIP_FILE" ]; then
-            echo "ERROR: AutoRouteVPN-updated.zip not found!"
+          if [ ! -d "$SDK_ROOT" ]; then
+            echo "ERROR: Android SDK directory not found: $SDK_ROOT"
             exit 1
           fi
 
-          mkdir -p "$CM_BUILD_DIR/source"
-          unzip -o "$ZIP_FILE" -d "$CM_BUILD_DIR/source"
+          SDKMANAGER="$(command -v sdkmanager || true)"
 
-      - name: Locate Android project
+          if [ -z "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$SDK_ROOT" -type f -name sdkmanager -print -quit 2>/dev/null || true)"
+          fi
+
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "ERROR: sdkmanager not found!"
+            exit 1
+          fi
+
+          echo "Android SDK: $SDK_ROOT"
+
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null || true
+
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install \
+            "platform-tools" \
+            "platforms;android-36"
+
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$CM_ENV"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$CM_ENV"
+
+      - name: Extract and locate project
         script: |
           set -e
 
-          SETTINGS_FILE=$(find "$CM_BUILD_DIR/source" -type f \
-            \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
-            -print -quit)
+          ZIP_FILE="$CM_BUILD_DIR/AutoRouteVPN-updated.zip"
+          SOURCE_DIR="$CM_BUILD_DIR/source"
+
+          if [ ! -f "$ZIP_FILE" ]; then
+            echo "ERROR: Project ZIP not found!"
+            ls -la "$CM_BUILD_DIR"
+            exit 1
+          fi
+
+          rm -rf "$SOURCE_DIR"
+          mkdir -p "$SOURCE_DIR"
+
+          unzip -q "$ZIP_FILE" -d "$SOURCE_DIR"
+
+          SETTINGS_FILE="$(find "$SOURCE_DIR" -type f \
+            \( -name settings.gradle -o -name settings.gradle.kts \) \
+            -print -quit)"
 
           if [ -z "$SETTINGS_FILE" ]; then
             echo "ERROR: Gradle settings file not found!"
-            find "$CM_BUILD_DIR/source" -maxdepth 5 -type f
             exit 1
           fi
 
-          PROJECT_DIR=$(dirname "$SETTINGS_FILE")
+          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
 
           if [ ! -f "$PROJECT_DIR/app/build.gradle" ] && \
              [ ! -f "$PROJECT_DIR/app/build.gradle.kts" ]; then
@@ -53,16 +85,40 @@ workflows:
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$CM_ENV"
           echo "Project found: $PROJECT_DIR"
 
-      - name: Configure Android SDK
+      - name: Install Gradle 8.13 and configure SDK
         script: |
           set -e
+
           cd "$PROJECT_DIR"
 
-          echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+          printf 'sdk.dir=%s\n' "$ANDROID_SDK_ROOT" > local.properties
 
-          FILE="app/build.gradle.kts"
+          GRADLE_VERSION="8.13"
+          GRADLE_DIST_DIR="$CM_BUILD_DIR/.gradle-dist"
+          GRADLE_HOME="$GRADLE_DIST_DIR/gradle-$GRADLE_VERSION"
+          GRADLE_BIN="$GRADLE_HOME/bin/gradle"
+
+          if [ ! -x "$GRADLE_BIN" ]; then
+            mkdir -p "$GRADLE_DIST_DIR"
+
+            curl --fail --location --retry 3 \
+              "https://services.gradle.org/distributions/gradle-$GRADLE_VERSION-bin.zip" \
+              --output "$GRADLE_DIST_DIR/gradle-$GRADLE_VERSION-bin.zip"
+
+            unzip -q -o \
+              "$GRADLE_DIST_DIR/gradle-$GRADLE_VERSION-bin.zip" \
+              -d "$GRADLE_DIST_DIR"
+          fi
+
+          if [ ! -x "$GRADLE_BIN" ]; then
+            echo "ERROR: Gradle installation failed!"
+            exit 1
+          fi
+
+          FILE="$PROJECT_DIR/app/build.gradle.kts"
+
           if [ ! -f "$FILE" ]; then
-            FILE="app/build.gradle"
+            FILE="$PROJECT_DIR/app/build.gradle"
           fi
 
           python3 - "$FILE" <<'PY'
@@ -72,61 +128,70 @@ workflows:
           path = sys.argv[1]
 
           with open(path, "r", encoding="utf-8") as f:
-              content = f.read()
+              text = f.read()
 
           patterns = [
-              r'compileSdk\s*=\s*\d+',
-              r'compileSdk\s+\d+'
+              r'(?m)^(\s*compileSdk\s*=\s*)\d+(\s*(?://.*)?)$',
+              r'(?m)^(\s*compileSdk\s+)\d+(\s*(?://.*)?)$',
           ]
 
-          updated = content
+          updated = text
+          count = 0
+
           for pattern in patterns:
               updated, count = re.subn(
                   pattern,
-                  lambda m: re.sub(r'\d+', '36', m.group()),
+                  r'\g<1>36\g<2>',
                   updated,
                   count=1
               )
               if count:
                   break
 
-          if updated != content:
-              with open(path, "w", encoding="utf-8") as f:
-                  f.write(updated)
-              print("compileSdk updated to 36")
-          else:
-              print("WARNING: compileSdk was not changed automatically")
+          if not count:
+              raise SystemExit(
+                  "ERROR: Could not safely update numeric compileSdk."
+              )
+
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(updated)
+
+          print("compileSdk successfully set to 36")
           PY
 
-      - name: Build Debug APK
+          grep -n "compileSdk" "$FILE"
+
+          echo "GRADLE_BIN=$GRADLE_BIN" >> "$CM_ENV"
+
+      - name: Build Android Debug APK
         script: |
           set -e
+
           cd "$PROJECT_DIR"
 
-          if [ -f "./gradlew" ]; then
-            chmod +x ./gradlew
-            ./gradlew --no-daemon --stacktrace assembleDebug
-          elif command -v gradle >/dev/null 2>&1; then
-            gradle --no-daemon --stacktrace assembleDebug
-          else
-            echo "ERROR: Gradle is not available!"
-            exit 1
-          fi
+          "$GRADLE_BIN" \
+            --no-daemon \
+            --stacktrace \
+            --build-cache \
+            assembleDebug
 
-      - name: Verify and prepare APK
+      - name: Verify and collect APK
         script: |
           set -e
 
-          APK=$(find "$PROJECT_DIR/app/build/outputs/apk" \
-            -type f -name "*.apk" -print -quit)
+          APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
 
-          if [ -z "$APK" ]; then
+          if [ ! -f "$APK" ]; then
             echo "ERROR: APK was not generated!"
+            find "$PROJECT_DIR/app/build/outputs" \
+              -type f -name '*.apk' -print 2>/dev/null || true
             exit 1
           fi
 
           mkdir -p "$CM_BUILD_DIR/output"
-          cp "$APK" "$CM_BUILD_DIR/output/AutoRouteVPN-debug.apk"
+
+          cp "$APK" \
+            "$CM_BUILD_DIR/output/AutoRouteVPN-debug.apk"
 
           echo "APK successfully generated:"
           ls -lh "$CM_BUILD_DIR/output/AutoRouteVPN-debug.apk"
