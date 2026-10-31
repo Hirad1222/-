@@ -1,60 +1,136 @@
 
-name: AutoRoute VPN APK Builder
+workflows:
+  autoroutevpn-android:
+    name: AutoRoute VPN - Android APK
+    max_build_duration: 60
+    instance_type: linux_x2
 
-on:
-  workflow_dispatch:
-  push:
-    paths:
-      - 'AutoRouteVPN-updated.zip'
-      - '.github/workflows/build.yml'
+    environment:
+      java: 17
 
-permissions:
-  contents: read
+    scripts:
+      - name: Install Android SDK 36
+        script: |
+          set -e
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager --install "platform-tools" "platforms;android-36"
 
-jobs:
-  build:
-    name: Build Android APK
-    runs-on: ubuntu-latest
+      - name: Extract project ZIP
+        script: |
+          set -e
+          ZIP_FILE="$CM_BUILD_DIR/AutoRouteVPN-updated.zip"
 
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+          if [ ! -f "$ZIP_FILE" ]; then
+            echo "ERROR: AutoRouteVPN-updated.zip not found!"
+            exit 1
+          fi
 
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
+          mkdir -p "$CM_BUILD_DIR/source"
+          unzip -o "$ZIP_FILE" -d "$CM_BUILD_DIR/source"
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          packages: platform-tools
+      - name: Locate Android project
+        script: |
+          set -e
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.13'
+          SETTINGS_FILE=$(find "$CM_BUILD_DIR/source" -type f \
+            \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
+            -print -quit)
 
-      - name: Extract Project
-        run: |
-          unzip -o AutoRouteVPN-updated.zip -d source
+          if [ -z "$SETTINGS_FILE" ]; then
+            echo "ERROR: Gradle settings file not found!"
+            find "$CM_BUILD_DIR/source" -maxdepth 5 -type f
+            exit 1
+          fi
 
-      - name: Verify Project Files
-        run: |
-          ls -la source/AutoRouteVPN
-          test -f source/AutoRouteVPN/settings.gradle || test -f source/AutoRouteVPN/settings.gradle.kts
+          PROJECT_DIR=$(dirname "$SETTINGS_FILE")
+
+          if [ ! -f "$PROJECT_DIR/app/build.gradle" ] && \
+             [ ! -f "$PROJECT_DIR/app/build.gradle.kts" ]; then
+            echo "ERROR: App Gradle file not found!"
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$CM_ENV"
+          echo "Project found: $PROJECT_DIR"
+
+      - name: Configure Android SDK
+        script: |
+          set -e
+          cd "$PROJECT_DIR"
+
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+
+          FILE="app/build.gradle.kts"
+          if [ ! -f "$FILE" ]; then
+            FILE="app/build.gradle"
+          fi
+
+          python3 - "$FILE" <<'PY'
+          import re
+          import sys
+
+          path = sys.argv[1]
+
+          with open(path, "r", encoding="utf-8") as f:
+              content = f.read()
+
+          patterns = [
+              r'compileSdk\s*=\s*\d+',
+              r'compileSdk\s+\d+'
+          ]
+
+          updated = content
+          for pattern in patterns:
+              updated, count = re.subn(
+                  pattern,
+                  lambda m: re.sub(r'\d+', '36', m.group()),
+                  updated,
+                  count=1
+              )
+              if count:
+                  break
+
+          if updated != content:
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(updated)
+              print("compileSdk updated to 36")
+          else:
+              print("WARNING: compileSdk was not changed automatically")
+          PY
 
       - name: Build Debug APK
-        run: |
-          cd source/AutoRouteVPN
-          gradle --no-daemon assembleDebug
+        script: |
+          set -e
+          cd "$PROJECT_DIR"
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: AutoRouteVPN-APK
-          path: source/AutoRouteVPN/app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
-          retention-days: 14
-          
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            ./gradlew --no-daemon --stacktrace assembleDebug
+          elif command -v gradle >/dev/null 2>&1; then
+            gradle --no-daemon --stacktrace assembleDebug
+          else
+            echo "ERROR: Gradle is not available!"
+            exit 1
+          fi
+
+      - name: Verify and prepare APK
+        script: |
+          set -e
+
+          APK=$(find "$PROJECT_DIR/app/build/outputs/apk" \
+            -type f -name "*.apk" -print -quit)
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK was not generated!"
+            exit 1
+          fi
+
+          mkdir -p "$CM_BUILD_DIR/output"
+          cp "$APK" "$CM_BUILD_DIR/output/AutoRouteVPN-debug.apk"
+
+          echo "APK successfully generated:"
+          ls -lh "$CM_BUILD_DIR/output/AutoRouteVPN-debug.apk"
+
+    artifacts:
+      - output/AutoRouteVPN-debug.apk
+      
