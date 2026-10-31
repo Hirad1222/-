@@ -18,51 +18,51 @@ workflows:
         script: |
           set -e
 
-          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/share/android-sdk}}"
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Library/Android/sdk}}"
           TOOLS_DIR="$SDK_ROOT/cmdline-tools"
           TEMP_DIR="$CM_BUILD_DIR/android-tools-temp"
 
           mkdir -p "$SDK_ROOT" "$TOOLS_DIR" "$TEMP_DIR"
 
           echo "Android SDK: $SDK_ROOT"
+          java -version
 
-          # Use modern Google command-line tools.
-          SDKMANAGER="$TOOLS_DIR/latest/bin/sdkmanager"
+          # Remove old command-line tools to prevent legacy sdkmanager usage.
+          rm -rf "$TOOLS_DIR/latest"
 
-          if [ ! -x "$SDKMANAGER" ]; then
-            echo "Downloading modern Android command-line tools..."
+          echo "Downloading modern Android command-line tools..."
 
-            curl --fail --location --retry 3 \
-              "https://dl.google.com/android/repository/commandlinetools-mac-13114758_latest.zip" \
-              --output "$TEMP_DIR/commandline-tools.zip"
+          curl --fail --location --retry 3 \
+            "https://dl.google.com/android/repository/commandlinetools-mac-13114758_latest.zip" \
+            --output "$TEMP_DIR/commandline-tools.zip"
 
-            mkdir -p "$TEMP_DIR/extracted"
+          mkdir -p "$TEMP_DIR/extracted"
 
-            unzip -q -o \
-              "$TEMP_DIR/commandline-tools.zip" \
-              -d "$TEMP_DIR/extracted"
+          unzip -q -o \
+            "$TEMP_DIR/commandline-tools.zip" \
+            -d "$TEMP_DIR/extracted"
 
-            if [ ! -f "$TEMP_DIR/extracted/cmdline-tools/bin/sdkmanager" ]; then
-              echo "ERROR: sdkmanager was not found in downloaded archive."
-              exit 1
-            fi
-
-            rm -rf "$TOOLS_DIR/latest"
-            mkdir -p "$TOOLS_DIR/latest"
-
-            cp -R "$TEMP_DIR/extracted/cmdline-tools/." \
-              "$TOOLS_DIR/latest/"
-          fi
-
-          SDKMANAGER="$TOOLS_DIR/latest/bin/sdkmanager"
-
-          if [ ! -x "$SDKMANAGER" ]; then
-            echo "ERROR: Modern sdkmanager installation failed."
+          if [ ! -f "$TEMP_DIR/extracted/cmdline-tools/bin/sdkmanager" ]; then
+            echo "ERROR: Modern sdkmanager was not found."
             exit 1
           fi
 
-          echo "Using: $SDKMANAGER"
-          java -version
+          mkdir -p "$TOOLS_DIR/latest"
+
+          cp -R "$TEMP_DIR/extracted/cmdline-tools/." \
+            "$TOOLS_DIR/latest/"
+
+          SDKMANAGER="$TOOLS_DIR/latest/bin/sdkmanager"
+
+          if [ ! -x "$SDKMANAGER" ]; then
+            echo "ERROR: sdkmanager is not executable."
+            exit 1
+          fi
+
+          echo "Using modern sdkmanager:"
+          echo "$SDKMANAGER"
+
+          "$SDKMANAGER" --version
 
           yes | "$SDKMANAGER" \
             --sdk_root="$SDK_ROOT" \
@@ -77,7 +77,7 @@ workflows:
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$CM_ENV"
           echo "ANDROID_HOME=$SDK_ROOT" >> "$CM_ENV"
 
-          echo "Android SDK setup completed."
+          echo "Modern Android SDK setup completed."
 
       - name: Extract and Locate Project
         script: |
@@ -117,7 +117,9 @@ workflows:
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$CM_ENV"
 
-          echo "Project located: $PROJECT_DIR"
+          echo "Project located:"
+          echo "$PROJECT_DIR"
+
           ls -la "$PROJECT_DIR"
 
       - name: Install Gradle 8.13
