@@ -1,5 +1,4 @@
-
-name: AutoRoute VPN - Android APK Builder
+name: Build AutoRoute VPN Debug APK
 
 on:
   workflow_dispatch:
@@ -7,202 +6,258 @@ on:
     branches:
       - main
     paths:
-      - 'AutoRouteVPN-updated.zip'
-      - '.github/workflows/build.yml'
+      - "AutoRouteVPN-updated.zip"
+      - ".github/workflows/build.yml"
 
 permissions:
   contents: read
 
 concurrency:
-  group: autoroutevpn-build-${{ github.ref }}
+  group: autoroute-vpn-apk-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  SOURCE_ZIP: "AutoRouteVPN-updated.zip"
+  JDK_VERSION: "17"
+  GRADLE_TARGET_VERSION: "8.13"
+  COMPILE_SDK_LEVEL: "36"
+  OUTPUT_DIR: "output"
+  APK_FILE_NAME: "AutoRouteVPN-debug.apk"
+
 jobs:
-  build:
-    name: Build AutoRoute VPN APK
+  build-debug-apk:
+    name: Build debug APK
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
-      - name: Checkout Repository
+      - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Setup Java 17
+      - name: Verify source ZIP exists and is valid
+        shell: bash
+        run: |
+          set -euo pipefail
+          zip_path="$GITHUB_WORKSPACE/$SOURCE_ZIP"
+          if [ ! -f "$zip_path" ]; then
+            echo "::error title=Source ZIP missing::$SOURCE_ZIP was not found in the repository root."
+            exit 1
+          fi
+          unzip -tq "$zip_path"
+          ls -lh "$zip_path"
+
+      - name: Set up JDK 17 (Temurin)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: ${{ env.JDK_VERSION }}
 
-      - name: Setup Android SDK
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK 36
+      - name: Locate Android SDK and sdkmanager
         shell: bash
         run: |
           set -euo pipefail
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [ -z "$sdk_root" ] || [ ! -d "$sdk_root" ]; then
+            echo "::error title=Android SDK missing::ANDROID_HOME is not set or does not point to a directory."
+            exit 1
+          fi
+          sdkmanager_bin="$sdk_root/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$sdkmanager_bin" ]; then
+            sdkmanager_bin="$(command -v sdkmanager || true)"
+          fi
+          if [ -z "$sdkmanager_bin" ] || [ ! -x "$sdkmanager_bin" ]; then
+            echo "::error title=sdkmanager missing::sdkmanager was not found in the Android SDK or on PATH."
+            exit 1
+          fi
+          echo "ANDROID_SDK_DIR=$sdk_root" >> "$GITHUB_ENV"
+          echo "SDKMANAGER_BIN=$sdkmanager_bin" >> "$GITHUB_ENV"
+          echo "Android SDK: $sdk_root"
+          echo "sdkmanager: $sdkmanager_bin"
 
-          yes | sdkmanager --licenses >/dev/null
+      - name: Accept Android SDK licenses
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$SDKMANAGER_BIN" --sdk_root="$ANDROID_SDK_DIR" --licenses < <(yes) > /dev/null
 
-          sdkmanager --install \
-            "platform-tools" \
-            "platforms;android-36"
+      - name: Install platform-tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$SDKMANAGER_BIN" --sdk_root="$ANDROID_SDK_DIR" --install "platform-tools"
 
-          echo "Android SDK packages:"
-          sdkmanager --list_installed
+      - name: Install Android platform 36
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$SDKMANAGER_BIN" --sdk_root="$ANDROID_SDK_DIR" --install "platforms;android-$COMPILE_SDK_LEVEL"
 
-      - name: Setup Gradle
+      - name: Set up Gradle 8.13
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.13'
+          gradle-version: ${{ env.GRADLE_TARGET_VERSION }}
 
-      - name: Extract Project
+      - name: Show toolchain versions
         shell: bash
         run: |
           set -euo pipefail
+          java -version
+          gradle --version
 
-          ZIP_FILE="AutoRouteVPN-updated.zip"
-
-          if [ ! -f "$ZIP_FILE" ]; then
-            echo "ERROR: Project ZIP was not found."
-            ls -la
-            exit 1
-          fi
-
-          mkdir -p source
-          unzip -o "$ZIP_FILE" -d source
-
-          echo "Extracted project files:"
-          find source -maxdepth 4 -type f | head -100
-
-      - name: Locate Android Project
+      - name: Extract AutoRouteVPN source ZIP
         shell: bash
         run: |
           set -euo pipefail
+          extract_root="$RUNNER_TEMP/autoroute-vpn-src"
+          rm -rf "$extract_root"
+          mkdir -p "$extract_root"
+          unzip -q "$GITHUB_WORKSPACE/$SOURCE_ZIP" -d "$extract_root"
+          echo "EXTRACT_ROOT=$extract_root" >> "$GITHUB_ENV"
+          echo "Extracted into $extract_root"
 
-          SETTINGS_FILE="$(find source -type f \
-            \( -name settings.gradle.kts -o -name settings.gradle \) \
-            -print -quit)"
-
-          if [ -z "$SETTINGS_FILE" ]; then
-            echo "ERROR: Gradle settings file not found."
-            exit 1
-          fi
-
-          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
-
-          if [ ! -f "$PROJECT_DIR/app/build.gradle.kts" ] && \
-             [ ! -f "$PROJECT_DIR/app/build.gradle" ]; then
-            echo "ERROR: App Gradle file not found."
-            exit 1
-          fi
-
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-
-          echo "Android project: $PROJECT_DIR"
-          ls -la "$PROJECT_DIR"
-
-      - name: Configure Compile SDK 36
+      - name: Locate Android project root
         shell: bash
         run: |
           set -euo pipefail
-
-          FILE="$PROJECT_DIR/app/build.gradle.kts"
-
-          if [ ! -f "$FILE" ]; then
-            FILE="$PROJECT_DIR/app/build.gradle"
-          fi
-
-          if [ ! -f "$FILE" ]; then
-            echo "ERROR: App Gradle configuration not found."
+          candidates="$(find "$EXTRACT_ROOT" -type f \( -name settings.gradle -o -name settings.gradle.kts \) -not -path '*/build/*' -not -path '*/.gradle/*' -printf '%d\t%p\n' | sort -n | cut -f2-)"
+          if [ -z "$candidates" ]; then
+            echo "::error title=Project root not found::No settings.gradle or settings.gradle.kts was found inside $SOURCE_ZIP."
             exit 1
           fi
+          echo "Settings files found (shallowest first):"
+          printf '%s\n' "$candidates"
+          settings_file="$(printf '%s\n' "$candidates" | sed -n '1p')"
+          project_dir="$(dirname "$settings_file")"
+          echo "PROJECT_DIR=$project_dir" >> "$GITHUB_ENV"
+          echo "Using project root: $project_dir"
 
-          python3 - "$FILE" <<'PY'
+      - name: Locate app module build file
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_build_file=""
+          for candidate in "$PROJECT_DIR/app/build.gradle.kts" "$PROJECT_DIR/app/build.gradle"; do
+            if [ -f "$candidate" ]; then
+              app_build_file="$candidate"
+              break
+            fi
+          done
+          if [ -z "$app_build_file" ]; then
+            matches="$(grep -rlE --include=build.gradle --include=build.gradle.kts --exclude-dir=build --exclude-dir=.gradle --exclude-dir=.git 'com\.android\.application' "$PROJECT_DIR" || true)"
+            app_build_file="$(printf '%s\n' "$matches" | sed -n '1p')"
+          fi
+          if [ -z "$app_build_file" ] || [ ! -f "$app_build_file" ]; then
+            echo "::error title=App module not found::No build.gradle or build.gradle.kts applying com.android.application was found."
+            exit 1
+          fi
+          echo "APP_BUILD_FILE=$app_build_file" >> "$GITHUB_ENV"
+          echo "Using app module build file: $app_build_file"
+
+      - name: Check compileSdk and align it with API 36
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$APP_BUILD_FILE" "$COMPILE_SDK_LEVEL" <<'PY'
           import re
           import sys
 
-          path = sys.argv[1]
+          build_file, target_text = sys.argv[1], sys.argv[2]
+          target = int(target_text)
 
-          with open(path, "r", encoding="utf-8") as f:
-              content = f.read()
+          with open(build_file, encoding="utf-8", errors="surrogateescape", newline="") as handle:
+              source = handle.read()
 
-          patterns = [
-              (r'compileSdk\s*=\s*\d+', 'compileSdk = 36'),
-              (r'compileSdk\s+\d+', 'compileSdk 36'),
-          ]
+          # Handles `compileSdk 34`, `compileSdk = 34`, `compileSdkVersion 34`
+          # and the AGP block form `version = release(34)`. Only the number changes.
+          declaration = re.compile(
+              r"(?m)^(\s*compileSdk(?:Version)?\s*=?\s*|\s*version\s*=\s*release\(\s*)"
+              r"(\d+)"
+              r"(\s*\)|(?=[ \t\r]*(?://[^\n]*)?$))"
+          )
 
-          updated = content
+          match = declaration.search(source)
+          if match is None:
+              print(f"::warning title=compileSdk not found::No numeric compileSdk value in {build_file}. Gradle will report any problem.")
+              sys.exit(0)
 
-          for pattern, replacement in patterns:
-              updated, count = re.subn(pattern, replacement, updated, count=1)
-              if count:
-                  break
+          current = int(match.group(2))
+          print(f"Detected compileSdk {current} in {build_file}")
 
-          if updated == content:
-              print("WARNING: compileSdk was not changed automatically.")
-              print("Current configuration:")
-              for line in content.splitlines():
-                  if "compileSdk" in line:
-                      print(line)
-          else:
-              with open(path, "w", encoding="utf-8") as f:
-                  f.write(updated)
-              print("compileSdk successfully set to 36.")
+          if current >= target:
+              print(f"compileSdk {current} is already compatible with API {target}. No change needed.")
+              sys.exit(0)
+
+          updated = declaration.sub(lambda m: f"{m.group(1)}{target}{m.group(3)}", source, count=1)
+
+          with open(build_file, "w", encoding="utf-8", errors="surrogateescape", newline="") as handle:
+              handle.write(updated)
+
+          print(f"Raised compileSdk from {current} to {target} in the build copy only. Repository files are not changed.")
           PY
 
-          grep -n "compileSdk" "$FILE" || true
-
-      - name: Build Debug APK
+      - name: Point Gradle at the Android SDK in the build copy
         shell: bash
         run: |
           set -euo pipefail
+          printf 'sdk.dir=%s\n' "$ANDROID_SDK_DIR" > "$PROJECT_DIR/local.properties"
+          echo "Wrote $PROJECT_DIR/local.properties"
 
+      - name: Build debug APK with Gradle
+        shell: bash
+        run: |
+          set -euo pipefail
           cd "$PROJECT_DIR"
+          gradle --no-daemon --stacktrace assembleDebug 2>&1 | tee "$RUNNER_TEMP/gradle-build.log"
 
-          gradle --no-daemon \
-            --stacktrace \
-            assembleDebug
+      - name: Upload Gradle log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoRouteVPN-build-log
+          path: ${{ runner.temp }}/gradle-build.log
+          if-no-files-found: warn
+          retention-days: 7
 
-      - name: Verify APK
+      - name: Verify debug APK and copy it to output
         shell: bash
         run: |
           set -euo pipefail
-
-          APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
-
-          if [ ! -f "$APK" ]; then
-            echo "ERROR: APK was not generated."
-            find "$PROJECT_DIR" -type f -name "*.apk"
+          module_dir="$(dirname "$APP_BUILD_FILE")"
+          apk_source="$module_dir/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -s "$apk_source" ]; then
+            apk_candidates="$(find "$PROJECT_DIR" -type f -path '*/build/outputs/apk/debug/*.apk' | sort)"
+            apk_source="$(printf '%s\n' "$apk_candidates" | sed -n '1p')"
+          fi
+          if [ -z "$apk_source" ] || [ ! -s "$apk_source" ]; then
+            echo "::error title=APK not produced::No debug APK was found after the build. Review the Build debug APK step log."
             exit 1
           fi
+          unzip -tq "$apk_source"
+          output_path="$GITHUB_WORKSPACE/$OUTPUT_DIR/$APK_FILE_NAME"
+          mkdir -p "$(dirname "$output_path")"
+          cp "$apk_source" "$output_path"
+          if [ ! -s "$output_path" ]; then
+            echo "::error title=Copy failed::The APK could not be copied to $OUTPUT_DIR/$APK_FILE_NAME."
+            exit 1
+          fi
+          apk_sha256="$(sha256sum "$output_path" | cut -d' ' -f1)"
+          apk_size="$(du -h "$output_path" | cut -f1)"
+          echo "APK source: $apk_source"
+          echo "APK output: $OUTPUT_DIR/$APK_FILE_NAME ($apk_size, sha256 $apk_sha256)"
+          {
+            echo "### AutoRoute VPN debug APK"
+            echo "- File: $OUTPUT_DIR/$APK_FILE_NAME"
+            echo "- Size: $apk_size"
+            echo "- SHA-256: $apk_sha256"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "APK successfully generated:"
-          ls -lh "$APK"
-
-          mkdir -p "$GITHUB_WORKSPACE/output"
-          cp "$APK" "$GITHUB_WORKSPACE/output/AutoRouteVPN-debug.apk"
-
-      - name: Upload APK Artifact
-        if: success()
+      - name: Upload debug APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: AutoRouteVPN-APK
-          path: output/AutoRouteVPN-debug.apk
+          path: ${{ env.OUTPUT_DIR }}/${{ env.APK_FILE_NAME }}
           if-no-files-found: error
           retention-days: 14
-
-      - name: Build Failure Information
-        if: failure()
-        shell: bash
-        run: |
-          echo "===================================="
-          echo "AutoRoute VPN BUILD FAILED"
-          echo "===================================="
-          echo "Please inspect the failed step above."
-          echo "Android SDK:"
-          sdkmanager --list_installed || true
-          echo "Java:"
-          java -version
-          echo "Gradle:"
-          gradle --version
-          
